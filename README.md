@@ -37,11 +37,27 @@ pip install -e .
 
 安装后，`cb` 命令就可以在当前虚拟环境中使用了。
 
-### 第二步：准备凭据
+### 第二步：运行配置向导
 
-工具需要两类凭据才能运行：
+最简单的方式就是运行一条命令，根据提示完成配置：
 
-**1. Canvas API Token**（用于获取课程和回放列表）
+```bash
+cb setup
+```
+
+这会引导你：
+1. 选择 LLM 提供商（aihubmix、OpenAI、DeepSeek、阿里云、硅基流动 或自定义）
+2. 输入对应的 API Key
+3. 选择使用的模型
+4. 设置是否使用代理
+
+配置会自动保存到 `config.yaml`。
+
+> 如果你喜欢手动编辑，也可以跳过 setup，直接复制 `cp config.yaml.example config.yaml` 后修改。
+
+### 第三步：准备其他凭据
+
+**Canvas API Token**（用于获取课程和回放列表）
 
 - 登录 Canvas → 账户 → 设置 → 滚到最底部 → 生成访问令牌
 - 把令牌写入文件：
@@ -51,32 +67,11 @@ mkdir -p ~/.config/canvas
 echo "你的token粘贴到这里" > ~/.config/canvas/token
 ```
 
-**2. 浏览器 Cookie**（用于访问回放平台 oc.sjtu.edu.cn）
+**浏览器 Cookie**（用于访问回放平台 oc.sjtu.edu.cn）
 
 - 用浏览器正常登录 [oc.sjtu.edu.cn](https://oc.sjtu.edu.cn)，保持登录状态即可
 - 工具默认会自动从 Chrome/Safari/Firefox 读取 Cookie（`cookies_from_browser: auto`）
 - 如果自动读取失败，可用 [EditThisCookie](https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg) 导出 JSON 后在 `config.yaml` 中指定路径
-
-**3. LLM API Key**（可选，用于生成笔记）
-
-不配置 LLM Key 也可以运行，会降级为输出平台原始摘要。
-
-```bash
-export LLM_API_KEY="你的APIKey"
-```
-
-默认使用 [aihubmix.com](https://aihubmix.com) 聚合接口、`qwen3-max` 模型。  
-你可以在 `config.yaml` 中修改 `base_url` 和 `model` 来切换提供商。
-
-### 第三步：复制配置文件
-
-```bash
-cp config.yaml.example config.yaml
-```
-
-根据需要修改 `config.yaml`，主要关注：
-- `llm.model`：使用的模型（如 `qwen3-max`、`deepseek/deepseek-chat`）
-- `llm.api_key_env`：存放 API Key 的环境变量名
 
 ---
 
@@ -174,6 +169,15 @@ data/downloads/<课程ID>/
 | OpenAI | `openai/gpt-4o` | `OPENAI_API_KEY` |
 | 阿里云通义 | `qwen/qwen-max` | `DASHSCOPE_API_KEY` |
 | 硅基流动 | `siliconflow/Qwen3-235B-A22B` | `SILICONFLOW_API_KEY` |
+
+如果你的服务是兼容 OpenAI 接口的，也可以直接配置：
+
+```yaml
+llm:
+  base_url: https://your-gateway.example.com/v1
+  api_key: sk-xxxx
+  model: your-model-name
+```
 
 也可在 `config.yaml` 的 `llm.providers` 中添加自定义提供商。
 

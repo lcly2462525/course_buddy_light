@@ -1,9 +1,12 @@
 import argparse
 import glob
+import json
 import sys
 from pathlib import Path
 
+import yaml
 from rich.console import Console
+from rich.prompt import Prompt, Confirm
 from rich.table import Table
 
 from .canvas_api import filter_real_courses, get_active_courses
@@ -181,6 +184,21 @@ def _resolve_note_sources(root_dir: str, course_id: str, glob_pattern: str | Non
     return pairs
 
 
+def _build_llm_cfg(cfg: dict, args) -> dict:
+    llm_cfg = dict(cfg.get("llm", {}))
+    if getattr(args, "no_llm", False):
+        llm_cfg["enabled"] = False
+    if getattr(args, "model", None):
+        llm_cfg["model"] = args.model
+    if getattr(args, "base_url", None):
+        llm_cfg["base_url"] = args.base_url
+    if getattr(args, "api_key", None):
+        llm_cfg["api_key"] = args.api_key
+    if getattr(args, "api_key_env", None):
+        llm_cfg["api_key_env"] = args.api_key_env
+    return llm_cfg
+
+
 def cmd_notes(args) -> int:
     cfg = load_config(args.config)
     course_meta = _find_course_meta(args.course, _load_courses())
@@ -209,11 +227,7 @@ def cmd_notes(args) -> int:
         raise RuntimeError("没有找到可用于生成笔记的 transcript/summary 文件。")
     _progress(f"共找到 {len(pairs)} 份可处理的 transcript。")
 
-    llm_cfg = dict(cfg.get("llm", {}))
-    if getattr(args, "no_llm", False):
-        llm_cfg["enabled"] = False
-    if getattr(args, "model", None):
-        llm_cfg["model"] = args.model
+    llm_cfg = _build_llm_cfg(cfg, args)
 
     generated = 0
     for idx, (transcript_path, summary_path) in enumerate(pairs, start=1):
@@ -248,6 +262,115 @@ def cmd_all(args) -> int:
     return result
 
 
+def cmd_setup(args) -> int:
+    """交互式初始化配置向导"""
+    config_path = Path(args.config).expanduser().resolve()
+    config_dir = config_path.parent
+
+    console.print("[bold cyan]欢迎使用 course-buddy-v2 配置向导[/bold cyan]\n")
+
+    # 选择 LLM 提供商
+    console.print("[yellow]第一步：选择 LLM 提供商[/yellow]")
+    console.print("请选择一个提供商（或输入 custom 自定义）：\n")
+    providers = [
+        ("1", "aihubmix（默认，推荐）", "https://aihubmix.com/v1", "LLM_API_KEY"),
+        ("2", "OpenAI", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+        ("3", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
+        ("4", "阿里云通义（Qwen）", "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY"),
+        ("5", "硅基流动（SiliconFlow）", "https://api.siliconflow.cn/v1", "SILICONFLOW_API_KEY"),
+        ("6", "自定义", None, None),
+    ]
+    for code, name, _, _ in providers:
+        console.print(f"  {code}. {name}")
+    
+    choice = Prompt.ask("\n请选择 (1-6)", choices=["1", "2", "3", "4", "5", "6"])
+    
+    selected = next((p for p in providers if p[0] == choice), None)
+    if not selected:
+        console.print("[red]无效选择[/red]")
+        return 1
+    
+    _, provider_name, base_url, api_key_env = selected
+    
+    if choice == "6":
+        # 自定义提供商
+        console.print("\n[yellow]自定义 LLM 提供商[/yellow]")
+        base_url = Prompt.ask("请输入 API 基础地址", default="https://example.com/v1")
+        api_key = Prompt.ask("请输入 API Key（或留空，稍后在环境变量中设置）", default="", password=True)
+        api_key_env = "LLM_API_KEY"
+        provider_name = "custom"
+    else:
+        # 内置提供商
+        model_hint = {
+            "1": "qwen-turbo",
+            "2": "gpt-4o",
+            "3": "deepseek-chat",
+            "4": "qwen-max",
+            "5": "Qwen3-235B-A22B",
+        }.get(choice, "")
+        api_key = Prompt.ask(f"\n请输入 {provider_name} 的 API Key（或留空，稍后在环境变量中设置）", default="", password=True)
+    
+    # 选择模型
+    console.print("\n[yellow]第二步：选择模型[/yellow]")
+    if choice == "6":
+        model = Prompt.ask("请输入模型名称", default="your-model")
+    else:
+        model_hint = {
+            "1": "qwen-turbo",
+            "2": "gpt-4o",
+            "3": "deepseek-chat",
+            "4": "qwen-max",
+            "5": "Qwen3-235B-A22B",
+        }.get(choice, "")
+        model = Prompt.ask(f"请输入模型名称", default=model_hint)
+    
+    # 其他配置
+    console.print("\n[yellow]第三步：其他设置[/yellow]")
+    use_proxy = Confirm.ask("是否使用环境变量中的代理（HTTP_PROXY/HTTPS_PROXY）？", default=True)
+    
+    # 构建配置
+    config = {
+        "root_dir": "data",
+        "cookies_path": "~/.config/canvas/cookies.json",
+        "cookies_from_browser": "auto",
+        "courses": {},
+        "llm": {
+            "enabled": True,
+            "api_key": api_key if api_key else "",
+            "api_key_env": api_key_env,
+            "base_url": base_url,
+            "model": model,
+            "temperature": 0.3,
+            "use_env_proxy": use_proxy,
+            "request_timeout": 600,
+            "retries": 3,
+            "notes_chunk_minutes": 12,
+            "notes_chunk_max_chars": 12000,
+            "notes_chunk_output_tokens": 2200,
+            "notes_merge_max_tokens": 8000,
+            "providers": {},
+        },
+    }
+    
+    # 保存配置
+    config_dir.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as f:
+        yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    
+    console.print(f"\n[green]✓ 配置已保存到：{config_path}[/green]")
+    
+    if not api_key:
+        console.print(f"[yellow]⚠️  提醒：你选择了在环境变量中设置 API Key[/yellow]")
+        console.print(f"   请在终端执行：[bold]export {api_key_env}=你的APIKey[/bold]")
+    
+    console.print("\n[cyan]下一步，请准备：[/cyan]")
+    console.print("  1. Canvas API Token → ~/.config/canvas/token")
+    console.print("  2. 浏览器 Cookie → 工具自动读取或手动配置")
+    console.print("\n之后就可以开始使用了：[bold]cb list[/bold]")
+    
+    return 0
+
+
 def cmd_read(args) -> int:
     cfg = load_config(args.config)
     _find_course_meta(args.course, _load_courses())
@@ -279,6 +402,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=_default_config_path(), help="配置文件路径")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    sub.add_parser("setup", help="交互式配置向导").set_defaults(handler=cmd_setup)
+
     sub.add_parser("list-courses", aliases=["list"], help="列出当前学期 Canvas 课程").set_defaults(handler=cmd_list_courses)
 
     p = sub.add_parser("list-replays", aliases=["list-videos"], help="列出课程回放")
@@ -303,6 +428,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", default=None, help="结合 --latest 使用，只在最近时间范围内选回放")
     p.add_argument("--force", action="store_true", help="覆盖已有笔记")
     p.add_argument("--model", default=None, help="指定 LLM 模型，支持 provider/model 格式")
+    p.add_argument("--base-url", default=None, help="自定义 LLM API 基础地址，例如 https://example.com/v1")
+    p.add_argument("--api-key", default=None, help="自定义 LLM API Key")
+    p.add_argument("--api-key-env", default=None, help="从指定环境变量读取 API Key")
     p.add_argument("--no-llm", action="store_true", help="不调用模型，直接输出平台摘要和转录摘录")
     p.set_defaults(handler=cmd_notes)
 
@@ -315,6 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--glob", default=None, help="生成笔记时使用的 transcript 匹配模式")
     p.add_argument("--force", action="store_true", help="覆盖已有 transcript 文本和笔记")
     p.add_argument("--model", default=None, help="指定 LLM 模型，支持 provider/model 格式")
+    p.add_argument("--base-url", default=None, help="自定义 LLM API 基础地址，例如 https://example.com/v1")
+    p.add_argument("--api-key", default=None, help="自定义 LLM API Key")
+    p.add_argument("--api-key-env", default=None, help="从指定环境变量读取 API Key")
     p.add_argument("--no-llm", action="store_true", help="不调用模型，直接输出平台摘要和转录摘录")
     p.set_defaults(handler=cmd_all)
 

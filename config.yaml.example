@@ -4,7 +4,10 @@ cookies_from_browser: auto
 courses: {}
 llm:
   enabled: true
+  # 直接填写也可以；如果不填，就会读取 api_key_env 对应的环境变量。
+  api_key: ""
   api_key_env: LLM_API_KEY
+  # 自定义兼容 OpenAI 的接口地址；留空时使用默认聚合接口。
   base_url: https://aihubmix.com/v1
   model: qwen-turbo
   temperature: 0.3

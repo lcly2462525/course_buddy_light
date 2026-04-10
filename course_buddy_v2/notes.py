@@ -23,7 +23,7 @@ def _get_llm_config(llm_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = llm_cfg or {}
     enabled = cfg.get("enabled", True)
     key_env = cfg.get("api_key_env", "LLM_API_KEY")
-    default_api_key = (
+    default_api_key = cfg.get("api_key") or (
         os.environ.get(key_env)
         or os.environ.get("LLM_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
@@ -38,9 +38,9 @@ def _get_llm_config(llm_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if model:
         resolved = resolve_provider(model, cfg)
         model = resolved["model"]
-        if resolved["base_url"]:
+        if not cfg.get("base_url") and resolved["base_url"]:
             base_url = resolved["base_url"]
-        if resolved["api_key"]:
+        if not cfg.get("api_key") and resolved["api_key"]:
             api_key = resolved["api_key"]
 
     return {
