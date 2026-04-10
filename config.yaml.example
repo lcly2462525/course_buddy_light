@@ -1,0 +1,18 @@
+root_dir: data
+cookies_path: ~/.config/canvas/cookies.json
+cookies_from_browser: auto
+courses: {}
+llm:
+  enabled: true
+  api_key_env: LLM_API_KEY
+  base_url: https://aihubmix.com/v1
+  model: qwen-turbo
+  temperature: 0.3
+  use_env_proxy: true
+  request_timeout: 600
+  retries: 3
+  notes_chunk_minutes: 12
+  notes_chunk_max_chars: 12000
+  notes_chunk_output_tokens: 2200
+  notes_merge_max_tokens: 8000
+  providers: {}

@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+course_buddy_v2/__init__.py
+course_buddy_v2/canvas_api.py
+course_buddy_v2/cli.py
+course_buddy_v2/config.py
+course_buddy_v2/llm_providers.py
+course_buddy_v2/notes.py
+course_buddy_v2/replay_api.py
+course_buddy_v2/transcript_api.py
+course_buddy_v2.egg-info/PKG-INFO
+course_buddy_v2.egg-info/SOURCES.txt
+course_buddy_v2.egg-info/dependency_links.txt
+course_buddy_v2.egg-info/entry_points.txt
+course_buddy_v2.egg-info/requires.txt
+course_buddy_v2.egg-info/top_level.txt

@@ -1,0 +1,4 @@
+[console_scripts]
+cb = course_buddy_v2.cli:main
+cb2 = course_buddy_v2.cli:main
+cbv2 = course_buddy_v2.cli:main
