@@ -4,7 +4,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -54,14 +54,81 @@ def _get_llm_config(llm_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "retries": int(cfg.get("retries", 1)),
         "notes_chunk_minutes": int(cfg.get("notes_chunk_minutes", 12)),
         "notes_chunk_max_chars": int(cfg.get("notes_chunk_max_chars", 12000)),
-        "notes_chunk_output_tokens": int(cfg.get("notes_chunk_output_tokens", 2200)),
-        "notes_merge_max_tokens": int(cfg.get("notes_merge_max_tokens", 8000)),
+        "notes_chunk_output_tokens": int(cfg.get("notes_chunk_output_tokens", 3200)),
+        "notes_merge_max_tokens": int(cfg.get("notes_merge_max_tokens", 12000)),
     }
 
 
-def _call_llm(prompt: str, llm: Dict[str, Any], max_tokens: int = 16000) -> Optional[str]:
+def _stream_chat_completion(
+    session: requests.Session,
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: int,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """以 SSE 流式方式调用 chat completions，返回 (content, finish_reason, error)。
+
+    必须用 streaming 否则 aihubmix 等托管端的边缘网关会在 60 秒空闲后掐断长生成请求。
+    """
+    try:
+        response = session.post(url, json=payload, headers=headers, timeout=timeout, stream=True)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    if response.status_code != 200:
+        body_preview = response.text[:300].replace("\n", " ").strip()
+        return None, None, f"HTTP {response.status_code}: {body_preview or 'empty response'}"
+
+    content_parts: List[str] = []
+    finish_reason: Optional[str] = None
+    stream_error: Optional[str] = None
+    try:
+        for raw_line in response.iter_lines(decode_unicode=False):
+            if not raw_line:
+                continue
+            if raw_line.startswith(b"data: "):
+                data = raw_line[6:]
+            elif raw_line.startswith(b"data:"):
+                data = raw_line[5:]
+            else:
+                continue
+            data = data.strip()
+            if not data or data == b"[DONE]":
+                if data == b"[DONE]":
+                    break
+                continue
+            try:
+                event = json.loads(data)
+            except Exception:
+                continue
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                content_parts.append(piece)
+            fr = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+    except Exception as exc:
+        stream_error = f"流式读取中断: {type(exc).__name__}: {exc}"
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    content = "".join(content_parts)
+    if not content:
+        return None, finish_reason, stream_error or "流式响应未返回内容"
+    return content, finish_reason, stream_error
+
+
+def _call_llm_result(prompt: str, llm: Dict[str, Any], max_tokens: int = 16000) -> Tuple[Optional[str], Optional[str]]:
     if not llm["enabled"] or not llm["api_key"]:
-        return None
+        return None, "LLM 未启用或未配置 API Key"
 
     url = llm["base_url"] + "/chat/completions"
     headers = {
@@ -73,6 +140,8 @@ def _call_llm(prompt: str, llm: Dict[str, Any], max_tokens: int = 16000) -> Opti
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": llm["temperature"],
+        # 必须 streaming：长生成耗时超过边缘网关空闲超时（aihubmix ~60s）会被掐断
+        "stream": True,
     }
     timeout = llm.get("request_timeout", 90)
     retries = max(1, int(llm.get("retries", 1)))
@@ -80,51 +149,40 @@ def _call_llm(prompt: str, llm: Dict[str, Any], max_tokens: int = 16000) -> Opti
     proxy_modes = [use_env_proxy]
     if use_env_proxy:
         proxy_modes.append(False)
+    last_error = None
 
     for trust_env in proxy_modes:
         for attempt in range(1, retries + 1):
-            try:
-                session = requests.Session()
-                session.trust_env = trust_env
-                response = session.post(url, json=payload, headers=headers, timeout=timeout)
-                if response.status_code != 200:
-                    if trust_env and attempt == retries:
-                        break
-                    if attempt == retries:
-                        return None
-                    continue
-                result = response.json()
-                choices = result.get("choices")
-                if not choices:
-                    if attempt == retries:
-                        break
-                    continue
-                content = (choices[0].get("message") or {}).get("content")
-                if not content:
-                    if attempt == retries:
-                        break
-                    continue
-                finish_reason = choices[0].get("finish_reason", "")
+            session = requests.Session()
+            session.trust_env = trust_env
+            content, finish_reason, error = _stream_chat_completion(
+                session, url, headers, payload, timeout
+            )
+            if content:
                 if finish_reason == "length" and max_tokens < 65000:
                     max_tokens = min(max_tokens * 2, 65000)
                     payload["max_tokens"] = max_tokens
                     continue
-                return content
-            except requests.exceptions.ProxyError:
+                return content, None
+            last_error = error or "未知错误"
+            # ProxyError：换 trust_env 模式
+            if "ProxyError" in last_error:
                 if trust_env and attempt == retries:
                     break
                 if attempt == retries:
-                    return None
+                    return None, last_error
                 continue
-            except requests.exceptions.Timeout:
-                if attempt == retries:
-                    return None
-                continue
-            except Exception:
-                if attempt == retries:
-                    return None
-                continue
-    return None
+            if attempt == retries:
+                if trust_env:
+                    break
+                return None, last_error
+            continue
+    return None, last_error
+
+
+def _call_llm(prompt: str, llm: Dict[str, Any], max_tokens: int = 16000) -> Optional[str]:
+    result, _ = _call_llm_result(prompt, llm, max_tokens=max_tokens)
+    return result
 
 
 def _call_llm_with_progress(
@@ -137,13 +195,83 @@ def _call_llm_with_progress(
 ) -> Optional[str]:
     if progress:
         progress(f"{label}：正在请求模型...")
-    result = _call_llm(prompt, llm, max_tokens=max_tokens)
+    result, error = _call_llm_result(prompt, llm, max_tokens=max_tokens)
     if progress:
         if result:
             progress(f"{label}：模型返回成功。")
         else:
-            progress(f"{label}：模型未返回可用结果。")
+            progress(f"{label}：模型未返回可用结果（{error or '未知原因'}）。")
     return result
+
+
+def _batched(items: List[str], batch_size: int) -> List[List[str]]:
+    return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _merge_partial_notes_with_progress(
+    partial_notes: List[str],
+    *,
+    course_name: str,
+    date_str: str,
+    title: str,
+    llm: Dict[str, Any],
+    progress: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    if not partial_notes:
+        return None
+    if len(partial_notes) == 1:
+        return partial_notes[0]
+
+    # 优先单次合并：把所有分片一次性交给模型。
+    # 相比之前的递归两两合并，少 1~2 次串行调用，重复读写的 token 显著减少，
+    # 整体更便宜也更快（5 分片场景大约省 60% token）。
+    if progress:
+        progress(f"总合并：一次性合并 {len(partial_notes)} 个分片...")
+    merge_prompt = _build_merge_prompt(partial_notes, course_name, date_str, title)
+    merged = _call_llm_with_progress(
+        merge_prompt,
+        llm,
+        max_tokens=llm["notes_merge_max_tokens"],
+        progress=progress,
+        label="总合并",
+    )
+    if merged:
+        return merged
+
+    if progress:
+        progress("总合并：一次性合并失败，回退到单轮并行分组合并。")
+
+    # 兜底:把分片切成 2~3 组,组间并发合并,组内一次到位,
+    # 然后本地拼接,不再递归(避免越合越慢)。
+    batch_size = max(2, (len(partial_notes) + 2) // 3)
+    groups = _batched(partial_notes, batch_size)
+    merged_parts: List[Optional[str]] = [None] * len(groups)
+
+    def _merge_one(idx: int, group: List[str]) -> Tuple[int, Optional[str]]:
+        if len(group) == 1:
+            return idx, group[0]
+        prompt = _build_merge_prompt(group, course_name, date_str, title)
+        result = _call_llm_with_progress(
+            prompt,
+            llm,
+            max_tokens=llm["notes_merge_max_tokens"],
+            progress=progress,
+            label=f"分组合并 {idx + 1}/{len(groups)}",
+        )
+        return idx, result
+
+    with ThreadPoolExecutor(max_workers=min(len(groups), 4)) as executor:
+        futures = [executor.submit(_merge_one, i, g) for i, g in enumerate(groups)]
+        for future in as_completed(futures):
+            idx, result = future.result()
+            if result:
+                merged_parts[idx] = result
+            else:
+                if progress:
+                    progress(f"分组合并 {idx + 1}/{len(groups)} 失败，保留原分段内容。")
+                merged_parts[idx] = "\n\n---\n\n".join(groups[idx])
+
+    return "\n\n---\n\n".join(part for part in merged_parts if part)
 
 
 def _load_json(path: str) -> dict:
@@ -366,17 +494,24 @@ def _build_prompt(
 - 口述数学用 LaTeX：行内 `$...$`，块级 `$$...$$`（禁用 `\[...\]`），范数 `\lVert x \rVert`
 - 老师强调"重要/会考/注意"处用 `> ⚠️ **重点**：`
 - 不添加转录外内容，不臆测，不重复，同一内容只写一次
+- 总体概要只做简明压缩，不要展开成长段说明
+- 对铺垫、讲故事、口头解释、重复性叙述，简要概括即可，不必逐句铺开
+- 尽量按老师上课的原始展开顺序组织内容，不要把后面才讲的内容提前
+- 遇到定义、定理、证明、推导、计算、例题时，尽量少跳步，保留关键中间式和理由
+- 不要把多步推导压缩成一句结论；如果老师中间确实省略了，只能明确写“老师此处略去若干细节/直接给出结论”
 
 输出格式：
 
 # {course_name} · {date_str} · {title}
 
 ## 一、总体概要
-- 分条列主题
+- 用尽量少的条目概括本讲主线
 ### 重要知识点
 
 ## 二、详细内容
 按讲课逻辑分小标题展开，含推导、公式、例子。
+若存在推导/证明/计算过程，优先写成 `1. 2. 3.` 的步骤式展开，保留中间公式、变形依据和最终结论。
+叙述性内容写紧凑些；推导性内容写细一些。
 
 ## 三、课堂事务
 签到/互动 | 课程安排通知 | 课后任务（`- [ ]` 格式）
@@ -403,7 +538,12 @@ def _build_chunk_prompt(
 ) -> str:
     return rf"""整理课堂转录分片 {chunk_index}/{chunk_total}（{_fmt_time(chunk_start)}-{_fmt_time(chunk_end)}），课程「{course_name}」{date_str}。
 
-规则：只基于本段，纠正术语错误（不确定标`[?]`），紧凑输出，保留公式/定理/结论/例子/强调点/课堂事务。公式用 `$...$`（行内）或 `$$...$$`（块级），禁用 `\[...\]`。
+规则：只基于本段，纠正术语错误（不确定标`[?]`），保留公式/定理/结论/例子/强调点/课堂事务。公式用 `$...$`（行内）或 `$$...$$`（块级），禁用 `\[...\]`。
+- 本段若是背景说明、直觉解释、讲故事或重复强调，简要概括即可，不要铺写过细
+- 尽量按本段实际讲述顺序整理，不要重排成过度概括的提纲
+- 如果本段出现推导、证明、计算、例题，按 `1. 2. 3.` 列步骤，保留关键中间式，不要只保留首尾结论
+- 详细度向推导部分倾斜：叙述从简，推导从细
+- 允许比以前更详细，但主要把篇幅用在老师明确讲过的关键步骤上
 
 输出格式：
 ### 分片 {chunk_index}（{_fmt_time(chunk_start)}-{_fmt_time(chunk_end)}）
@@ -422,10 +562,18 @@ def _build_merge_prompt(partial_notes: List[str], course_name: str, date_str: st
     combined = "\n---\n".join(partial_notes)
     return rf"""合并以下分段笔记为完整笔记。去重但不丢信息，不添加分段中没有的内容。
 
+要求：
+- 总体概要保持简洁，只保留主线和重要知识点
+- 对讲故事、背景说明、口头铺垫、重复性解释，合并为简洁表述即可
+- 优先保持老师原本的讲解顺序和推导顺序
+- 遇到推导、证明、计算过程，尽量保留中间步骤和中间公式，不要合并时压缩掉
+- 不要因为追求简洁而省略课堂里已经明确讲过的关键推导步骤
+- 如果分段笔记之间信息冲突，以更具体、步骤更完整的一版为准
+
 输出格式：
 # {course_name} · {date_str} · {title}
 ## 一、总体概要（分条列主题 + 重要知识点）
-## 二、详细内容（按逻辑分小标题，含推导/公式/例子，公式用 `$...$` 或 `$$...$$`，禁用 `\[...\]`）
+## 二、详细内容（按逻辑分小标题，含推导/公式/例子；涉及推导时优先用 `1. 2. 3.` 写步骤，公式用 `$...$` 或 `$$...$$`，禁用 `\[...\]`）
 ## 三、课堂事务（签到/通知/作业，无则注明）
 
 老师强调处用 `> ⚠️ **重点**：`，不确定标 `[?]`。
@@ -510,12 +658,12 @@ def summarize_transcript_files(
                 chunk_end=chunk["end"],
                 transcript_text=chunk["text"],
             )
-            result = _call_llm(prompt, llm, max_tokens=llm["notes_chunk_output_tokens"])
+            result, error = _call_llm_result(prompt, llm, max_tokens=llm["notes_chunk_output_tokens"])
             if progress:
                 if result:
                     progress(f"分片 {idx}/{total}：模型返回成功。")
                 else:
-                    progress(f"分片 {idx}/{total}：未拿到结果，将依赖其他分片继续合并。")
+                    progress(f"分片 {idx}/{total}：未拿到结果（{error or '未知原因'}），将依赖其他分片继续合并。")
             return idx, result
 
         max_workers = min(total, 4)
@@ -535,13 +683,13 @@ def summarize_transcript_files(
         if partial_notes:
             if progress:
                 progress(f"已完成 {len(partial_notes)} 个分片，正在进行总合并...")
-            merge_prompt = _build_merge_prompt(partial_notes, course_name, date_str, title)
-            merged = _call_llm_with_progress(
-                merge_prompt,
-                llm,
-                max_tokens=llm["notes_merge_max_tokens"],
+            merged = _merge_partial_notes_with_progress(
+                partial_notes,
+                course_name=course_name,
+                date_str=date_str,
+                title=title,
+                llm=llm,
                 progress=progress,
-                label="总合并",
             )
             if merged:
                 if progress:

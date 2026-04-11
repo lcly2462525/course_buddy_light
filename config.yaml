@@ -13,6 +13,6 @@ llm:
   retries: 3
   notes_chunk_minutes: 12
   notes_chunk_max_chars: 12000
-  notes_chunk_output_tokens: 2200
-  notes_merge_max_tokens: 8000
+  notes_chunk_output_tokens: 3200
+  notes_merge_max_tokens: 12000
   providers: {}

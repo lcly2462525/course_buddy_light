@@ -18,8 +18,6 @@ dependencies = [
 
 [project.scripts]
 cb = "course_buddy_v2.cli:main"
-cb2 = "course_buddy_v2.cli:main"
-cbv2 = "course_buddy_v2.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["course_buddy_v2*"]
